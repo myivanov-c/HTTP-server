@@ -1,0 +1,144 @@
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   main.cpp                                           :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: myivanov <myivanov@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2026/07/15 14:51:28 by myivanov          #+#    #+#             */
+/*   Updated: 2026/11/18 13:46:08 by myivanov         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <HTTPrequest.hpp>
+#include <Client.hpp>
+#include <Server.hpp>
+#include <ConfigDirectives.hpp>
+
+#include <poll.h>
+#include <vector>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <algorithm>
+#include <netdb.h>
+#include <signal.h>
+#include <fcntl.h>
+
+int create_server_socket() {
+    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket == -1) {
+        std::cout << "Error\nServer socket FD is " << serverSocket << std::endl;
+        return -1;
+    }
+
+    int opt = 1;
+	if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
+		std::cerr << "setsockopt(SO_REUSEADDR) failed: " << strerror(errno) << std::endl;
+		close(serverSocket);
+		return -1;
+	}
+
+    return serverSocket;
+}
+
+
+void	configureSocketAddress(Server &s)
+{
+	std::memset(&s.socketAddress, 0, sizeof(s.socketAddress));
+	s.socketAddress.sin_family = AF_INET;
+    s.socketAddress.sin_port = htons(s.serversConfs.getListenPort());
+	
+	struct addrinfo hints;
+	struct addrinfo *result;
+
+	std::memset(&hints, 0, sizeof(hints));
+
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+
+	if (getaddrinfo(s.serversConfs.getHost().c_str(), NULL, &hints, &result) != 0) {
+		std::cout << "getaddrinfo failed" << std::endl;
+		return;
+	}
+
+	s.socketAddress.sin_addr = ((struct sockaddr_in *)result->ai_addr)->sin_addr;
+
+	freeaddrinfo(result);
+}
+
+
+int main(int ac, char **av)
+{
+	if(ac != 2)
+	{
+		std::cout << "Error: no argument provided" << std::endl;
+		return 1;
+	}
+
+	std::vector<Server> servers;
+	if (!fillServerConfig(av[1], servers))
+		return -1;
+
+    std::cout << "Server is now listening..." << std::endl;
+	signal(SIGPIPE, SIG_IGN);
+	for (size_t i = 0; i < servers.size(); ++i)
+	{
+			servers[i].serverSocket = create_server_socket();
+			if (servers[i].serverSocket == -1)
+				return 1;
+			configureSocketAddress(servers[i]);
+
+		if (fcntl(servers[i].serverSocket, F_SETFL, O_NONBLOCK) == -1)
+		{
+			std::cerr << "fcntl listen socket failed: " << strerror(errno) << std::endl;
+			close(servers[i].serverSocket);
+			return 1;
+		}
+
+			if (bind(servers[i].serverSocket, (struct sockaddr *)&servers[i].socketAddress, sizeof(servers[i].socketAddress)) == -1) {
+				std::cerr << "bind failed: " << strerror(errno) << std::endl;
+				return -1;
+			}
+			if (listen(servers[i].serverSocket, 120) == -1)
+				return -1;
+
+			pollfd serverPollFd = {};
+			serverPollFd.fd = servers[i].serverSocket;
+			serverPollFd.events = POLLIN;
+		
+			servers[i].pollfds_vector.push_back(serverPollFd);
+
+	}
+
+	std::vector<Server *> peerServers;
+	for (size_t i = 0; i < servers.size(); ++i)
+		peerServers.push_back(&servers[i]);
+	for (size_t i = 0; i < servers.size(); ++i)
+	{
+		servers[i].setServerId(i);
+		servers[i].setPeerServers(peerServers);
+	}
+
+	if (signal(SIGINT, signalHandler) == SIG_ERR)
+		return 1;
+
+	if (signal(SIGTERM, signalHandler) == SIG_ERR)
+		return 1;
+
+	if (!servers.empty())
+		servers[0].run();
+
+	for (size_t i = 0; i < servers.size(); ++i)
+	{
+    	while (!servers[i].pollfds_vector.empty())
+        	servers[i].disconnectClient(servers[i].pollfds_vector.size() - 1);
+
+    	close(servers[i].serverSocket);
+	}
+
+
+	std::cout << "server closed" << std::endl;
+
+	return 0;
+}
+
